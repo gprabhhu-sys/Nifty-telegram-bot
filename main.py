@@ -13,6 +13,8 @@ Env vars required (set as GitHub Secrets, see README.md):
   TELEGRAM_CHAT_ID
 """
 
+import csv
+import io
 import os
 from datetime import datetime
 
@@ -23,8 +25,8 @@ import yfinance as yf
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Edit this list any time to change which stocks the screener covers.
-NIFTY50 = [
+# Used only if the live Nifty 500 list can't be fetched (NSE site hiccup etc).
+FALLBACK_SYMBOLS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
     "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "BAJFINANCE.NS",
     "KOTAKBANK.NS", "LT.NS", "HCLTECH.NS", "ASIANPAINT.NS", "AXISBANK.NS",
@@ -36,6 +38,40 @@ NIFTY50 = [
     "BPCL.NS", "BRITANNIA.NS", "HEROMOTOCO.NS", "APOLLOHOSP.NS", "TECHM.NS",
     "UPL.NS", "BAJAJ-AUTO.NS", "HINDALCO.NS", "SHRIRAMFIN.NS", "TRENT.NS",
 ]
+
+NIFTY500_CSV_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+
+def get_nifty500_symbols():
+    """Fetch the current Nifty 500 constituent list live from NSE.
+
+    NSE's site blocks plain requests without a browser-like session, so we
+    first hit the homepage to pick up cookies, then request the CSV.
+    Falls back to a small static list if anything goes wrong.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,application/vnd.ms-excel,*/*",
+    }
+    try:
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=15)
+        resp = session.get(NIFTY500_CSV_URL, headers=headers, timeout=15)
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        symbols = [
+            row["Symbol"].strip() + ".NS"
+            for row in reader
+            if row.get("Symbol")
+        ]
+        if len(symbols) > 100:
+            return symbols
+    except Exception:
+        pass
+    return FALLBACK_SYMBOLS
 
 INDICES = {"NIFTY 50": "^NSEI", "SENSEX": "^BSESN", "BANK NIFTY": "^NSEBANK"}
 
@@ -67,16 +103,28 @@ def get_indices():
     return out
 
 
-def get_screener():
+def get_screener(symbols):
+    """Batch-download recent prices for all symbols at once (fast, avoids
+    hammering Yahoo Finance with 500 individual requests)."""
     rows = []
-    for sym in NIFTY50:
-        try:
-            hist = yf.Ticker(sym).history(period="5d")
-            last, pct = pct_change(hist)
-            if last is not None:
-                rows.append((sym.replace(".NS", ""), last, pct))
-        except Exception:
-            continue
+    try:
+        data = yf.download(
+            symbols, period="5d", group_by="ticker", threads=True, progress=False
+        )
+    except Exception:
+        data = None
+
+    if data is not None:
+        for sym in symbols:
+            try:
+                hist = data[sym] if len(symbols) > 1 else data
+                hist = hist.dropna()
+                last, pct = pct_change(hist)
+                if last is not None:
+                    rows.append((sym.replace(".NS", ""), last, pct))
+            except Exception:
+                continue
+
     rows.sort(key=lambda r: r[2], reverse=True)
     top_gainers = rows[:5]
     top_losers = sorted(rows, key=lambda r: r[2])[:5]
@@ -116,14 +164,15 @@ def build_message():
             lines.append(f"{name}: {last:,.2f}  {fmt_pct(pct)}")
         lines.append("")
 
-    gainers, losers = get_screener()
+    symbols = get_nifty500_symbols()
+    gainers, losers = get_screener(symbols)
     if gainers:
-        lines.append("*Top Gainers (Nifty 50)*")
+        lines.append("*Top Gainers (Nifty 500)*")
         for sym, price, pct in gainers:
             lines.append(f"{sym}: \u20b9{price:,.2f}  {fmt_pct(pct)}")
         lines.append("")
     if losers:
-        lines.append("*Top Losers (Nifty 50)*")
+        lines.append("*Top Losers (Nifty 500)*")
         for sym, price, pct in losers:
             lines.append(f"{sym}: \u20b9{price:,.2f}  {fmt_pct(pct)}")
         lines.append("")
