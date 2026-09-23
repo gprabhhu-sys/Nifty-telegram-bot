@@ -17,9 +17,14 @@ import csv
 import html
 import io
 import os
+import re
 from datetime import datetime
 
 import feedparser
+import matplotlib
+matplotlib.use("Agg")  # no display needed, just save to file
+import matplotlib.pyplot as plt
+import pandas as pd
 import requests
 import yfinance as yf
 
@@ -108,32 +113,170 @@ def get_indices():
     return out
 
 
-def get_screener(symbols):
-    """Batch-download recent prices for all symbols at once (fast, avoids
-    hammering Yahoo Finance with 500 individual requests)."""
-    rows = []
+def download_history(symbols, period="1y"):
+    """One batch download used by the gainers/losers table AND the three
+    native screeners below, so we only hit Yahoo Finance once per run."""
     try:
-        data = yf.download(
-            symbols, period="5d", group_by="ticker", threads=True, progress=False
+        return yf.download(
+            symbols, period=period, group_by="ticker", threads=True, progress=False
         )
-    except Exception:
-        data = None
+    except Exception as e:
+        print("Batch download failed:", e)
+        return None
 
+
+def symbol_frame(data, sym, symbols):
+    try:
+        df = data[sym] if len(symbols) > 1 else data
+        return df.dropna()
+    except Exception:
+        return None
+
+
+def get_screener(symbols, data):
+    """Top 5 gainers & losers over the latest session."""
+    rows = []
     if data is not None:
         for sym in symbols:
-            try:
-                hist = data[sym] if len(symbols) > 1 else data
-                hist = hist.dropna()
-                last, pct = pct_change(hist)
-                if last is not None:
-                    rows.append((sym.replace(".NS", ""), last, pct))
-            except Exception:
+            df = symbol_frame(data, sym, symbols)
+            if df is None:
                 continue
-
+            last, pct = pct_change(df)
+            if last is not None:
+                rows.append((sym.replace(".NS", ""), last, pct))
     rows.sort(key=lambda r: r[2], reverse=True)
-    top_gainers = rows[:5]
-    top_losers = sorted(rows, key=lambda r: r[2])[:5]
-    return top_gainers, top_losers
+    return rows[:5], sorted(rows, key=lambda r: r[2])[:5]
+
+
+def compute_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
+
+
+def scan_volume_spike(symbols, data, max_items=10):
+    """Volume > 2x its 20-day average, price > Rs 5, above 50 EMA,
+    RSI(14) > 55, turnover > Rs 5 crore."""
+    hits = []
+    for sym in symbols:
+        df = symbol_frame(data, sym, symbols)
+        if df is None or len(df) < 55:
+            continue
+        try:
+            close, vol = df["Close"], df["Volume"]
+            vol_sma20 = vol.rolling(20).mean().iloc[-1]
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            rsi14 = compute_rsi(close, 14).iloc[-1]
+            c, v = close.iloc[-1], vol.iloc[-1]
+            if (
+                v > vol_sma20 * 2
+                and c > 5
+                and c > ema50
+                and rsi14 > 55
+                and c * v > 50_000_000
+            ):
+                hits.append(sym.replace(".NS", ""))
+        except Exception:
+            continue
+    return hits[:max_items]
+
+
+def scan_swing_expansion(symbols, data, max_items=10):
+    """Volume > 1.25x its 20-day EMA, +3% day, decent liquidity."""
+    hits = []
+    for sym in symbols:
+        df = symbol_frame(data, sym, symbols)
+        if df is None or len(df) < 25:
+            continue
+        try:
+            close, vol = df["Close"], df["Volume"]
+            vol_ema20 = vol.ewm(span=20, adjust=False).mean().iloc[-1]
+            close_ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+            c, prev_c, v = close.iloc[-1], close.iloc[-2], vol.iloc[-1]
+            if (
+                v > vol_ema20 * 1.25
+                and c / prev_c >= 1.03
+                and close_ema20 * vol_ema20 >= 20_000_000
+            ):
+                hits.append(sym.replace(".NS", ""))
+        except Exception:
+            continue
+    return hits[:max_items]
+
+
+def scan_near_52w_high(symbols, data, max_items=10):
+    """Within 25% of the 250-day high, above 50 EMA, liquid, no wild single-day move."""
+    hits = []
+    for sym in symbols:
+        df = symbol_frame(data, sym, symbols)
+        if df is None or len(df) < 55:
+            continue
+        try:
+            close, vol, high = df["Close"], df["Volume"], df["High"]
+            max250 = high.rolling(min(250, len(high)), min_periods=50).max().iloc[-1]
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            vol_ema50 = vol.ewm(span=50, adjust=False).mean().iloc[-1]
+            c, prev_c = close.iloc[-1], close.iloc[-2]
+            day_change = (c - prev_c) / prev_c * 100
+            if (
+                c >= max250 * 0.75
+                and c >= 30
+                and c >= ema50
+                and vol_ema50 * c >= 75_000_000
+                and -3 <= day_change <= 5
+            ):
+                hits.append(sym.replace(".NS", ""))
+        except Exception:
+            continue
+    return hits[:max_items]
+
+
+def get_chartink_results(scan_clause, max_items=10):
+    """Pull live results for a scan clause straight from Chartink (used for
+    screens needing fundamentals data we can't reliably source elsewhere).
+    Unofficial endpoint - can break if Chartink changes their site."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+    }
+    try:
+        session = requests.Session()
+        page = session.get("https://chartink.com/screener/process", headers=headers, timeout=15)
+        match = re.search(r'name="csrf-token" content="([^"]+)"', page.text)
+        if not match:
+            return []
+        headers["x-csrf-token"] = match.group(1)
+        resp = session.post(
+            "https://chartink.com/screener/process",
+            headers=headers,
+            data={"scan_clause": scan_clause},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("data", [])
+        return [row.get("nsecode") or row.get("name") or "?" for row in rows[:max_items]]
+    except Exception as e:
+        print("Chartink fetch failed:", e)
+        return []
+
+
+CANSLIM_SCAN_CLAUSE = (
+    '( {cash} ( quarterly eps after extraordinary items basic > 4 quarters ago '
+    'eps after extraordinary items basic and quarterly net sales > 4 quarters '
+    'ago net sales and quarterly net profit/reported profit after tax > 4 '
+    'quarters ago net profit/reported profit after tax and daily close > daily '
+    'sma ( daily close , 200 ) and daily sma ( daily close , 50 ) > daily sma ( '
+    'daily close , 200 ) and market cap > 300 and daily volume > daily sma ( '
+    'daily volume , 20 ) and yearly return on net worth percentage > 15 and '
+    'yearly return on capital employed percentage > 15 and yearly debt equity '
+    'ratio < 1.5 and daily cci ( 34 ) > 100 ) )'
+)
 
 
 def get_news(max_items=10):
@@ -170,7 +313,9 @@ def build_message():
         lines.append("")
 
     symbols = get_nifty500_symbols()
-    gainers, losers = get_screener(symbols)
+    data = download_history(symbols, period="1y")
+
+    gainers, losers = get_screener(symbols, data)
     if gainers:
         lines.append("<b>Top Gainers (Nifty 500)</b>")
         for sym, price, pct in gainers:
@@ -182,6 +327,31 @@ def build_message():
             lines.append(f"{html.escape(sym)}: \u20b9{price:,.2f}  {fmt_pct(pct)}")
         lines.append("")
 
+    if data is not None:
+        vol_spike = scan_volume_spike(symbols, data)
+        if vol_spike:
+            lines.append("<b>\U0001F4E2 Volume Spike Scanner</b>")
+            lines.append(", ".join(html.escape(s) for s in vol_spike))
+            lines.append("")
+
+        swing_exp = scan_swing_expansion(symbols, data)
+        if swing_exp:
+            lines.append("<b>\U0001F680 Swing Volume Expansion</b>")
+            lines.append(", ".join(html.escape(s) for s in swing_exp))
+            lines.append("")
+
+        near_high = scan_near_52w_high(symbols, data)
+        if near_high:
+            lines.append("<b>\U0001F3AF Near 52-Week High</b>")
+            lines.append(", ".join(html.escape(s) for s in near_high))
+            lines.append("")
+
+    canslim = get_chartink_results(CANSLIM_SCAN_CLAUSE)
+    if canslim:
+        lines.append("<b>\U0001F4AA Prabhu Swing Trade (Quality + Momentum)</b>")
+        lines.append(", ".join(html.escape(s) for s in canslim))
+        lines.append("")
+
     news = get_news()
     if news:
         lines.append("<b>Market News</b>")
@@ -189,6 +359,31 @@ def build_message():
             lines.append(f"\u2022 {html.escape(headline)}")
 
     return "\n".join(lines).strip()
+
+
+def generate_index_chart(path="nifty_chart.png"):
+    """Draw a simple 1-month line chart of the Nifty 50 index and save as PNG."""
+    try:
+        hist = yf.Ticker("^NSEI").history(period="1mo")
+        if hist.empty:
+            return None
+        up = hist["Close"].iloc[-1] >= hist["Close"].iloc[0]
+        color = "#1a9e46" if up else "#d9362a"
+
+        plt.figure(figsize=(8, 4.5))
+        plt.plot(hist.index, hist["Close"], color=color, linewidth=2)
+        plt.fill_between(hist.index, hist["Close"], hist["Close"].min(), color=color, alpha=0.08)
+        plt.title("NIFTY 50 \u2014 Last 1 Month", fontsize=13, fontweight="bold")
+        plt.ylabel("Close (\u20b9)")
+        plt.grid(alpha=0.25)
+        plt.xticks(rotation=30, ha="right")
+        plt.tight_layout()
+        plt.savefig(path, dpi=150)
+        plt.close()
+        return path
+    except Exception as e:
+        print("Chart generation failed:", e)
+        return None
 
 
 def send_telegram(message):
@@ -208,9 +403,28 @@ def send_telegram(message):
     resp.raise_for_status()
 
 
+def send_telegram_photo(photo_path, caption=""):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
+            files={"photo": f},
+            timeout=60,
+        )
+    if not resp.ok:
+        print("Telegram photo error:", resp.text)
+    resp.raise_for_status()
+
+
 if __name__ == "__main__":
     msg = build_message() or "No market data available today."
     if len(msg) > 4000:  # Telegram's hard limit is 4096 chars
         msg = msg[:4000] + "\n\n\u2026(truncated)"
     send_telegram(msg)
+
+    chart_path = generate_index_chart()
+    if chart_path:
+        send_telegram_photo(chart_path, caption="NIFTY 50 \u2014 1 Month chart")
+
     print("Report sent successfully.")
